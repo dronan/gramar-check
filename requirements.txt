@@ -1,0 +1,5 @@
+pyobjc-framework-ApplicationServices
+pyobjc-framework-Cocoa
+rumps
+openai
+requests
