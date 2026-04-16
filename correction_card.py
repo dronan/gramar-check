@@ -1,4 +1,4 @@
-Correction card — Floating NSPanel popover.
+"""Correction card — Floating NSPanel popover.
 
 show_single  clicked a red (spelling) underline  → compact word card
 show_all     clicked a yellow (grammar) underline → sentence diff card

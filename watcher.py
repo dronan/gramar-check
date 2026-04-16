@@ -5,11 +5,30 @@ and checks the current paragraph via LanguageTool (free).
 import threading
 import time
 
-_TEXT_ROLES = {"AXTextField", "AXTextArea"}
+_TEXT_ROLES = {
+    "AXTextField", "AXTextArea",
+    # Electron / Chrome / WhatsApp contentEditables
+    "AXWebArea", "AXDocument", "AXGroup", "AXComboBox",
+}
 MAX_TEXT_LEN = 600   # LanguageTool free-tier limit
 MIN_TEXT_LEN = 8
 # If text changes by more than this in one poll tick, it's a focus/paste, not typing
 _FOCUS_CHANGE_DELTA = 80
+
+
+def _wake_chromium_accessibility(pid: int):
+    """Apply AXManualAccessibility=True to force Electron/Chrome to expose text nodes."""
+    try:
+        from ApplicationServices import (
+            AXUIElementCreateApplication,
+            AXUIElementSetAttributeValue,
+        )
+        app_el = AXUIElementCreateApplication(pid)
+        if app_el:
+            AXUIElementSetAttributeValue(app_el, "AXManualAccessibility", True)
+            print(f"[watcher] woke AX for pid={pid}")
+    except Exception as e:
+        print(f"[watcher] wake_chromium error: {e}")
 
 
 def _focused_role() -> str | None:
@@ -25,8 +44,6 @@ def _focused_role() -> str | None:
         if err or focused is None:
             return None
 
-        # Descend into container elements (AXWebArea, AXScrollArea, etc.)
-        # to find the actual text element — standard native technique.
         for _ in range(8):
             err2, inner = AXUIElementCopyAttributeValue(focused, kAXFocusedUIElementAttribute, None)
             if err2 or inner is None or inner == focused:
@@ -34,7 +51,31 @@ def _focused_role() -> str | None:
             focused = inner
 
         err, role = AXUIElementCopyAttributeValue(focused, kAXRoleAttribute, None)
-        return str(role) if (not err and role) else None
+        role_str = str(role) if (not err and role) else None
+
+        # Chrome/Electron: kAXFocusedUIElement doesn't propagate through web
+        # containers. Query the app element to get the actual focused node.
+        _WEB_CONT = {"AXWebArea", "AXDocument", "AXGroup", "AXComboBox"}
+        if role_str in _WEB_CONT:
+            try:
+                from ApplicationServices import AXUIElementCreateApplication
+                from AppKit import NSWorkspace
+                frontmost = NSWorkspace.sharedWorkspace().frontmostApplication()
+                if frontmost:
+                    app_el = AXUIElementCreateApplication(frontmost.processIdentifier())
+                    err3, app_focused = AXUIElementCopyAttributeValue(
+                        app_el, kAXFocusedUIElementAttribute, None
+                    )
+                    if not err3 and app_focused is not None:
+                        err4, inner_role = AXUIElementCopyAttributeValue(
+                            app_focused, kAXRoleAttribute, None
+                        )
+                        if not err4 and inner_role:
+                            return str(inner_role)
+            except Exception:
+                pass
+
+        return role_str
     except Exception:
         return None
 
@@ -59,6 +100,7 @@ class TextWatcher:
         self._running = False
         self._enabled = True
         self._prev_in_text = False
+        self._last_pid: int | None = None
 
     def start(self):
         self._running = True
@@ -98,10 +140,16 @@ class TextWatcher:
                         continue
 
                     from ax_monitor import get_focused_pid
-                    if get_focused_pid() == os.getpid():
+                    current_pid = get_focused_pid()
+                    if current_pid == os.getpid():
                         # Focus shifted to our non-activating panel / click view
                         time.sleep(0.5)
                         continue
+
+                    # Wake Chromium/Electron accessibility when switching apps
+                    if current_pid and current_pid != self._last_pid:
+                        _wake_chromium_accessibility(current_pid)
+                        self._last_pid = current_pid
 
                     role = _focused_role()
                     if role not in _TEXT_ROLES:

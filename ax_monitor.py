@@ -209,8 +209,18 @@ def _check_permission() -> bool:
 # Text read / write  (pyobjc — strings work fine)
 # ---------------------------------------------------------------------------
 
+_WEB_ROLES = {"AXWebArea", "AXDocument", "AXGroup", "AXComboBox"}
+
+
 def _deep_focused_element_pyobjc():
-    """Returns the deepest focused AX element using pyobjc, or None."""
+    """
+    Returns the deepest focused AX element using pyobjc, or None.
+
+    For Chrome/Electron, kAXFocusedUIElementAttribute does NOT propagate through
+    web-content containers (AXWebArea).  The reliable path is to query the
+    Chrome *application* element directly — it always returns the actual focused
+    node (e.g. the <input> field), not just the container.
+    """
     system = AXUIElementCreateSystemWide()
     err, focused = AXUIElementCopyAttributeValue(system, kAXFocusedUIElementAttribute, None)
     if err or focused is None:
@@ -220,7 +230,46 @@ def _deep_focused_element_pyobjc():
         if err2 or inner is None or inner == focused:
             break
         focused = inner
+
+    # If the descent stopped at a web container, ask Chrome's app element directly.
+    err_r, role = AXUIElementCopyAttributeValue(focused, kAXRoleAttribute, None)
+    if not err_r and role in _WEB_ROLES:
+        try:
+            from ApplicationServices import AXUIElementCreateApplication
+            from AppKit import NSWorkspace
+            frontmost = NSWorkspace.sharedWorkspace().frontmostApplication()
+            if frontmost:
+                app_el = AXUIElementCreateApplication(frontmost.processIdentifier())
+                err3, app_focused = AXUIElementCopyAttributeValue(
+                    app_el, kAXFocusedUIElementAttribute, None
+                )
+                if not err3 and app_focused is not None:
+                    print(f"[ax_monitor] web-container bypass → app focused element")
+                    return app_focused
+        except Exception as exc:
+            print(f"[ax_monitor] app-element fallback failed: {exc}")
+
     return focused
+
+
+def _extract_text_from_children(element, depth: int = 0) -> str:
+    """Recursively concatenate AXStaticText values inside contenteditable containers."""
+    if depth > 12:
+        return ""
+    try:
+        err, role = AXUIElementCopyAttributeValue(element, kAXRoleAttribute, None)
+        if not err and role == "AXStaticText":
+            err, value = AXUIElementCopyAttributeValue(element, kAXValueAttribute, None)
+            return str(value) if (not err and value) else ""
+
+        err, children = AXUIElementCopyAttributeValue(element, "AXChildren", None)
+        if err or children is None:
+            return ""
+
+        parts = [_extract_text_from_children(c, depth + 1) for c in children]
+        return "\n".join(p for p in parts if p)
+    except Exception:
+        return ""
 
 
 def read_full_text() -> str | None:
@@ -231,9 +280,14 @@ def read_full_text() -> str | None:
         if focused is None:
             return None
         err, value = AXUIElementCopyAttributeValue(focused, kAXValueAttribute, None)
-        if err or value is None:
-            return None
-        return str(value)
+        if not err and value:
+            return str(value)
+        # For Electron/Chrome contentEditables the value is empty — walk the children tree
+        err_r, role = AXUIElementCopyAttributeValue(focused, kAXRoleAttribute, None)
+        if not err_r and role in _WEB_ROLES:
+            text = _extract_text_from_children(focused)
+            return text if text else None
+        return None
     except Exception:
         return None
 
@@ -248,16 +302,33 @@ def replace_full_text(new_text: str) -> bool:
         err = AXUIElementSetAttributeValue(focused, kAXValueAttribute, new_text)
         if err == 0:
             return True
-        # Fallback: select all + replace selection
-        import Quartz, time
+        # Clipboard fallback: save pasteboard → Cmd+A → Cmd+V → restore pasteboard
+        import AppKit, Quartz, time
+        pb = AppKit.NSPasteboard.generalPasteboard()
+        # Snapshot current clipboard
+        saved_types = list(pb.types() or [])
+        saved_data = {t: pb.dataForType_(t) for t in saved_types if pb.dataForType_(t)}
+        # Place corrected text in clipboard
+        pb.clearContents()
+        pb.setString_forType_(new_text, AppKit.NSPasteboardTypeString)
+        # Cmd+A  (select all)
         src = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
         for down in (True, False):
-            ev = Quartz.CGEventCreateKeyboardEvent(src, 0x00, down)  # 'a'
+            ev = Quartz.CGEventCreateKeyboardEvent(src, 0x00, down)  # keycode 'a'
             Quartz.CGEventSetFlags(ev, Quartz.kCGEventFlagMaskCommand)
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
-        time.sleep(0.06)
-        err = AXUIElementSetAttributeValue(focused, kAXSelectedTextAttribute, new_text)
-        return err == 0
+        time.sleep(0.05)
+        # Cmd+V  (paste)
+        for down in (True, False):
+            ev = Quartz.CGEventCreateKeyboardEvent(src, 0x09, down)  # keycode 'v'
+            Quartz.CGEventSetFlags(ev, Quartz.kCGEventFlagMaskCommand)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+        time.sleep(0.1)
+        # Restore original clipboard silently
+        pb.clearContents()
+        for t, data in saved_data.items():
+            pb.setData_forType_(data, t)
+        return True
     except Exception:
         return False
 
